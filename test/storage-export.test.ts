@@ -10,7 +10,7 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach, beforeAll, afterAll } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
@@ -142,5 +142,36 @@ describe('export --restore-only resolution chain (D5)', () => {
     await tryRunExport(['--dir', outDir]);
     expect(exitCode).toBeNull();
     expect(stdout.some((line) => line.includes('Exporting 0'))).toBe(true);
+  });
+
+  test('restore-only honors explicit --source and does not restore same-prefix pages from other sources', async () => {
+    writeFileSync(
+      join(tmp, 'gbrain.yml'),
+      `storage:\n  db_tracked: []\n  db_only:\n    - media/x/\n`,
+    );
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ('alpha', 'Alpha'), ('beta', 'Beta')`,
+    );
+    await engine.putPage('media/x/alpha-only', {
+      type: 'note' as any,
+      title: 'Alpha only',
+      compiled_truth: 'Alpha source page',
+      timeline: '',
+      frontmatter: {},
+    }, { sourceId: 'alpha' });
+    await engine.putPage('media/x/beta-only', {
+      type: 'note' as any,
+      title: 'Beta only',
+      compiled_truth: 'Beta source page',
+      timeline: '',
+      frontmatter: {},
+    }, { sourceId: 'beta' });
+
+    await tryRunExport(['--dir', outDir, '--restore-only', '--repo', tmp, '--source', 'alpha']);
+
+    expect(exitCode).toBeNull();
+    expect(stdout.some((line) => line.includes('Restoring 1'))).toBe(true);
+    expect(existsSync(join(outDir, 'media/x/alpha-only.md'))).toBe(true);
+    expect(existsSync(join(outDir, 'media/x/beta-only.md'))).toBe(false);
   });
 });

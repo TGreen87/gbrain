@@ -14,8 +14,9 @@
  * separate Postgres E2E tests.
  */
 
-import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { resetPgliteState } from './helpers/reset-pglite.ts';
 
 delete process.env.GBRAIN_PGLITE_SNAPSHOT;
 
@@ -191,6 +192,76 @@ describe('purgeDeletedPages (TTL boundary)', () => {
     expect(result.count).toBeGreaterThanOrEqual(0);
     expect(Number.isFinite(result.count)).toBe(true);
   });
+});
+
+describe('soft-delete dashboard metrics', () => {
+  let engine: PGLiteEngine;
+
+  beforeAll(async () => {
+    engine = await setupBrain();
+  }, 30000);
+
+  afterAll(async () => {
+    await engine.disconnect();
+  });
+
+  beforeEach(async () => {
+    await resetPgliteState(engine);
+  });
+
+  test('getStats pages_by_type excludes soft-deleted rows', async () => {
+    await engine.putPage('stats/active-note', {
+      type: 'note' as any,
+      title: 'Active note',
+      compiled_truth: 'active stats row',
+      timeline: '',
+      frontmatter: {},
+    });
+    await engine.putPage('stats/deleted-note', {
+      type: 'note' as any,
+      title: 'Deleted note',
+      compiled_truth: 'deleted stats row',
+      timeline: '',
+      frontmatter: {},
+    });
+    await engine.softDeletePage('stats/deleted-note');
+    const stats = await engine.getStats();
+    expect(stats.pages_by_type.note).toBe(1);
+  }, 30000);
+
+  test('getHealth excludes soft-deleted pages and their links from graph metrics', async () => {
+    await engine.putPage('health/active-person', {
+      type: 'person' as any,
+      title: 'Active person',
+      compiled_truth: 'active graph row',
+      timeline: '',
+      frontmatter: {},
+    });
+    await engine.putPage('health/deleted-person', {
+      type: 'person' as any,
+      title: 'Deleted person',
+      compiled_truth: 'deleted graph row',
+      timeline: '',
+      frontmatter: {},
+    });
+    const pageRows = await engine.executeRaw<{ id: number; slug: string }>(
+      `SELECT id, slug FROM pages WHERE slug IN ($1, $2)`,
+      ['health/active-person', 'health/deleted-person'],
+    );
+    const ids = Object.fromEntries(pageRows.map((r) => [r.slug, r.id]));
+    await engine.executeRaw(
+      `INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source)
+       VALUES ($1, $2, 'mentions', 'soft-deleted graph edge', 'manual')`,
+      [ids['health/active-person'], ids['health/deleted-person']],
+    );
+    await engine.softDeletePage('health/deleted-person');
+    const health = await engine.getHealth();
+    expect(health.page_count).toBe(1);
+    expect(health.orphan_pages).toBe(1);
+    expect(health.dead_links).toBe(0);
+    expect(health.link_density_score).toBe(0);
+    expect(health.most_connected.map((p) => p.slug)).not.toContain('health/deleted-person');
+  }, 30000);
 });
 
 describe('getPage / listPages includeDeleted contract (Q3 IRON RULE)', () => {

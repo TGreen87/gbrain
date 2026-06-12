@@ -2,6 +2,18 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.41.0] - 2026-06-12
+
+**Restore exports and dashboard health numbers now respect the source you asked for.** In a multi-source brain, `gbrain export --restore-only` could pull restore candidates from the wrong source when the operator relied on source defaults, and the health/stat counters could still count rows you had already soft-deleted. That made restore work noisy and dashboard health look worse than the visible brain. This release keeps restore-only export resolution on the explicit/default source path and makes stats, health, and graph metrics ignore soft-deleted rows.
+
+### Fixed
+- **`export --restore-only` stays source-safe.** The restore resolution chain honors explicit `--source` and the source's default local path without restoring same-prefix pages from other sources.
+- **Health and stats ignore soft-deleted rows.** `getStats` page-type counts and `getHealth` graph metrics now exclude soft-deleted pages and links involving them on both engines.
+- **PGLite dashboard tests follow the shared test-isolation pattern.** The new dashboard-metric regressions use one engine plus per-test reset instead of repeatedly cold-booting PGLite engines.
+
+### To take advantage of v0.42.41.0
+`gbrain upgrade`. No configuration needed. If a restore-only export or health dashboard looked polluted by deleted/cross-source rows, rerun the command after upgrading.
+
 ## [0.42.40.0] - 2026-06-09
 
 **`gbrain extract --stale` no longer aborts partway through a brain that contains emoji or other non-BMP characters.** On a large brain, link/timeline extraction could die with `invalid input syntax for type json` and commit nothing — and because the staleness bookmark only advances on a clean finish, every retry re-hit the same point and extraction stayed wedged. The cause: the link-context excerpt was sliced by raw UTF-16 index, so a window boundary landing inside an emoji's surrogate pair left an unpaired surrogate half in the text, which Postgres rejects when the batch is serialized to JSONB — taking down the whole batch, not just the one row. (PGLite is more permissive here, so this primarily bit the managed-Postgres engine.)

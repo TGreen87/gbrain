@@ -5,7 +5,7 @@ import { serializeMarkdown } from '../core/markdown.ts';
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import { loadStorageConfig, isDbOnly } from '../core/storage-config.ts';
-import { getDefaultSourcePath } from '../core/source-resolver.ts';
+import { getDefaultSourcePath, resolveSourceId } from '../core/source-resolver.ts';
 import type { PageType } from '../core/types.ts';
 
 export async function runExport(engine: BrainEngine, args: string[]) {
@@ -20,6 +20,11 @@ export async function runExport(engine: BrainEngine, args: string[]) {
 
   const slugPrefixIdx = args.indexOf('--slug-prefix');
   const slugPrefix = slugPrefixIdx !== -1 ? args[slugPrefixIdx + 1] : undefined;
+
+  const sourceIdx = args.indexOf('--source');
+  const explicitSource = sourceIdx !== -1
+    ? args[sourceIdx + 1]
+    : args.find((a) => a.startsWith('--source='))?.slice('--source='.length);
 
   const restoreOnly = args.includes('--restore-only');
 
@@ -63,6 +68,13 @@ export async function runExport(engine: BrainEngine, args: string[]) {
   const filters: import('../core/types.ts').PageFilters = { limit: 100000 };
   if (typeFilter) filters.type = typeFilter;
   if (slugPrefix) filters.slugPrefix = slugPrefix;
+  // Multi-source safety: export/restore-only must honor the same source routing
+  // as the rest of the CLI when a caller supplies --source or GBRAIN_SOURCE.
+  // Without this, a restore-only backup for a sandbox/source can silently pull
+  // same-prefix pages from other sources.
+  if (explicitSource || process.env.GBRAIN_SOURCE) {
+    filters.sourceId = await resolveSourceId(engine, explicitSource ?? null);
+  }
 
   let pages: import('../core/types.ts').Page[];
 
