@@ -95,6 +95,17 @@ describe('parseConversationMessages', () => {
 // ---------------------------------------------------------------------------
 
 describe('splitIntoSegments', () => {
+  test('legacy thin turn becomes one extractable two-message segment', () => {
+    const msgs = parseConversationMessages(
+      'User: Record the supplier decision Assistant: Decision captured with evidence.',
+      { fallbackDate: '2026-07-11' },
+    );
+    expect(msgs.map((message) => message.speaker)).toEqual(['User', 'Assistant']);
+    const segs = splitIntoSegments(msgs);
+    expect(segs).toHaveLength(1);
+    expect(segs[0].messages).toHaveLength(2);
+  });
+
   test('cuts on time gap larger than gapMinutes', () => {
     const msgs = parseConversationMessages([
       fmt('Alice Example', '2024-03-15', '9:00 AM', 'a'),

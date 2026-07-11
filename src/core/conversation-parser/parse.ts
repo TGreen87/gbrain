@@ -142,6 +142,53 @@ function extractTimezone(page: ParseConversationOpts['page']): string | undefine
   return typeof tz === 'string' && tz.length > 0 ? tz : undefined;
 }
 
+const HERMES_THIN_TURN_PAIR_ID = 'thin-turn-pair';
+const HERMES_THIN_TURN_PREFIX = 'User:';
+const HERMES_THIN_TURN_BOUNDARY = ' Assistant: ';
+
+/**
+ * Parse the legacy Hermes memory-provider shape:
+ *
+ *   User: <user text> Assistant: <assistant text>
+ *
+ * The producer flattened one complete turn onto one line, so the generic
+ * one-anchor-per-line registry cannot represent it. Accept exactly one
+ * boundary and fail closed when the line is ambiguous. New producers emit
+ * the native signal-export shape; this path keeps existing brain pages
+ * extractable without rewriting their stored bodies.
+ */
+function parseHermesThinTurnPair(
+  body: string,
+  opts: ParseConversationOpts,
+  dateCtx: DateContext,
+): MatchedMessage[] | null {
+  const lines = getNonBlankLines(body);
+  if (lines.length !== 1) return null;
+  const line = lines[0];
+  if (!line.startsWith(HERMES_THIN_TURN_PREFIX)) return null;
+
+  const splitAt = line.indexOf(HERMES_THIN_TURN_BOUNDARY);
+  if (splitAt < 0 || splitAt !== line.lastIndexOf(HERMES_THIN_TURN_BOUNDARY)) {
+    return null;
+  }
+  const user = line.slice(HERMES_THIN_TURN_PREFIX.length, splitAt).trim();
+  const assistant = line
+    .slice(splitAt + HERMES_THIN_TURN_BOUNDARY.length)
+    .trim();
+  if (!user || !assistant) return null;
+
+  const capturedAt = opts.page?.frontmatter?.captured_at;
+  const capturedMs = typeof capturedAt === 'string' ? Date.parse(capturedAt) : NaN;
+  const timestamp = Number.isFinite(capturedMs)
+    ? new Date(capturedMs).toISOString()
+    : `${dateCtx.fallbackDate}T00:00:00Z`;
+
+  return [
+    { speaker: 'User', timestamp, text: user },
+    { speaker: 'Assistant', timestamp, text: assistant },
+  ];
+}
+
 /**
  * Map a 12-hour pattern to 24-hour using the AM/PM marker.
  * 12 AM = 0, 12 PM = 12, 1..11 PM = 13..23.
@@ -445,6 +492,18 @@ export function parseConversation(
 
   // Assemble candidate pool: built-ins (minus disabled) + user patterns.
   const disabledSet = new Set(opts.disabledBuiltinIds ?? []);
+  if (!disabledSet.has(HERMES_THIN_TURN_PAIR_ID)) {
+    const hermesPair = parseHermesThinTurnPair(body, opts, dateCtx);
+    if (hermesPair) {
+      return {
+        messages: hermesPair,
+        phase: 'regex_match',
+        matched_pattern_id: HERMES_THIN_TURN_PAIR_ID,
+        patterns_scored: 1,
+        unmatched_line_count: opts.diagnostic ? 0 : undefined,
+      };
+    }
+  }
   const builtinPool = BUILTIN_PATTERNS.filter((p) => !disabledSet.has(p.id));
   const userPool = opts.userPatterns ?? [];
   const candidates: readonly PatternEntry[] = [...builtinPool, ...userPool];

@@ -307,6 +307,45 @@ describe('parseConversation — degenerate inputs', () => {
   });
 });
 
+describe('parseConversation — thin-turn pair regression', () => {
+  test('splits one legacy User/Assistant line into two messages', () => {
+    const page = makePage({ captured_at: '2026-07-11T04:00:14.203Z' });
+    const r = parseConversation(
+      'User: any other things we should look at? Assistant: Yes. Trace the full memory path.',
+      { page, diagnostic: true },
+    );
+    expect(r.phase).toBe('regex_match');
+    expect(r.matched_pattern_id).toBe('thin-turn-pair');
+    expect(r.messages).toEqual([
+      {
+        speaker: 'User',
+        timestamp: '2026-07-11T04:00:14.203Z',
+        text: 'any other things we should look at?',
+      },
+      {
+        speaker: 'Assistant',
+        timestamp: '2026-07-11T04:00:14.203Z',
+        text: 'Yes. Trace the full memory path.',
+      },
+    ]);
+    expect(r.unmatched_line_count).toBe(0);
+  });
+
+  test('fails closed when the line has more than one Assistant boundary', () => {
+    const r = parseConversation(
+      'User: quoted Assistant: text Assistant: real response',
+      { fallbackDate: '2026-07-11' },
+    );
+    expect(r.phase).toBe('no_match');
+    expect(r.messages).toEqual([]);
+  });
+
+  test('fails closed when either side of the pair is empty', () => {
+    expect(parseConversation('User: Assistant: reply').phase).toBe('no_match');
+    expect(parseConversation('User: hello Assistant:').phase).toBe('no_match');
+  });
+});
+
 // ---------------------------------------------------------------------------
 // applyPattern — direct unit tests for the matcher
 // ---------------------------------------------------------------------------
