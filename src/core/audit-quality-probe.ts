@@ -118,5 +118,6 @@ export function readRecentQualityProbeEvents(
       }
     }
   }
+  out.sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
   return out;
 }

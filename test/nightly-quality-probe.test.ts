@@ -17,6 +17,10 @@ import {
   type NightlyProbeResult,
 } from '../src/core/cycle/nightly-quality-probe.ts';
 import { withEnv } from './helpers/with-env.ts';
+import {
+  computeQualityProbeAuditFilename,
+  readRecentQualityProbeEvents,
+} from '../src/core/audit-quality-probe.ts';
 
 // ---------------------------------------------------------------------------
 // Hermetic audit dir per test
@@ -84,6 +88,31 @@ describe('shouldRunNightly (pure function, rate-limit logic)', () => {
       60 * 60 * 1000,
     );
     expect(r).toEqual({ run: true });
+  });
+});
+
+describe('quality-probe audit ordering', () => {
+  test('current and prior ISO-week files return chronologically', async () => {
+    await withEnv({ GBRAIN_AUDIT_DIR: auditTmp }, async () => {
+      const now = new Date('2026-07-11T03:00:00Z');
+      const current = join(auditTmp, computeQualityProbeAuditFilename(now));
+      const prior = join(
+        auditTmp,
+        computeQualityProbeAuditFilename(new Date(now.getTime() - 7 * 86400000)),
+      );
+      const base = {
+        outcome: 'error', exit_code: 1, pass_count: 0, fail_count: 0,
+        inconclusive_count: 0, error_count: 1, est_cost_usd: 0,
+      };
+      writeFileSync(current, JSON.stringify({ ...base, ts: '2026-07-10T19:10:00Z' }) + '\n');
+      writeFileSync(prior, JSON.stringify({ ...base, ts: '2026-07-05T19:10:00Z' }) + '\n');
+
+      const events = readRecentQualityProbeEvents(14, now);
+      expect(events.map(event => event.ts)).toEqual([
+        '2026-07-05T19:10:00Z',
+        '2026-07-10T19:10:00Z',
+      ]);
+    });
   });
 });
 

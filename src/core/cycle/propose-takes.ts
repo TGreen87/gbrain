@@ -42,6 +42,7 @@ import { BaseCyclePhase, type ScopedReadOpts, type BasePhaseOpts } from './base-
 import { chat as gatewayChat } from '../ai/gateway.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../extract/rollup-writer.ts';
+import { loadOpCheckpoint, recordCompleted } from '../op-checkpoint.ts';
 import { GBrainError } from '../types.ts';
 import type { Page, PageFilters } from '../types.ts';
 import type { OperationContext } from '../operations.ts';
@@ -137,6 +138,8 @@ export interface ProposeTakesOpts extends BasePhaseOpts {
   repoPath?: string;
   /** Limit pages processed in this cycle (for triage / quick smoke). Default: 100. */
   pageLimit?: number;
+  /** Hard ceiling on gateway calls in one phase invocation. Default: 10. */
+  maxLlmCalls?: number;
   /** Inject the LLM call for tests; production uses gateway.chat. */
   extractor?: ProposeTakesExtractor;
   /** Override prompt_version (tests). */
@@ -152,6 +155,8 @@ export interface ProposeTakesResult {
   cache_hits: number;
   cache_misses: number;
   proposals_inserted: number;
+  llm_calls: number;
+  request_limit_reached: boolean;
   budget_exhausted: boolean;
   warnings: string[];
 }
@@ -306,6 +311,12 @@ class ProposeTakesPhase extends BaseCyclePhase {
     const extractor = opts.extractor ?? defaultExtractor;
     const promptVersion = opts.promptVersion ?? PROPOSE_TAKES_PROMPT_VERSION;
     const pageLimit = opts.pageLimit ?? 100;
+    const maxLlmCallsRaw = opts.maxLlmCalls
+      ?? Number.parseInt(process.env.GBRAIN_PROPOSE_TAKES_MAX_LLM_CALLS ?? '10', 10);
+    const maxLlmCalls = Number.isFinite(maxLlmCallsRaw) && maxLlmCallsRaw > 0
+      ? Math.floor(maxLlmCallsRaw)
+      : 10;
+    const resolvedModel = opts.model ?? process.env.GBRAIN_PROPOSE_TAKES_MODEL;
     const skipPagesWithFence = opts.skipPagesWithFence ?? false;
     const proposalRunId = `propose-${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')}-${randomUUID().slice(0, 8)}`;
 
@@ -314,9 +325,21 @@ class ProposeTakesPhase extends BaseCyclePhase {
       cache_hits: 0,
       cache_misses: 0,
       proposals_inserted: 0,
+      llm_calls: 0,
+      request_limit_reached: false,
       budget_exhausted: false,
       warnings: [],
     };
+
+    // `take_proposals` only caches pages that produced at least one row.
+    // Persist every successfully evaluated page through the shared DB-backed
+    // checkpoint, including pages whose correct extractor result is `[]`.
+    const checkpoint = {
+      op: 'propose_takes',
+      fingerprint: contentHash(`propose_takes|${promptVersion}`).slice(0, 16),
+    };
+    const processedPages = new Set(await loadOpCheckpoint(engine, checkpoint));
+    let checkpointNeedsRefresh = processedPages.size > 0;
 
     // Load pages eligible for proposal. Source-scoped per BaseCyclePhase.
     const pageFilters: PageFilters = {
@@ -342,9 +365,14 @@ class ProposeTakesPhase extends BaseCyclePhase {
       const ch = contentHash(body);
       const existingTakes = extractExistingTakesForDedup(body);
 
-      // Idempotency check. If a row exists for (source_id, page_slug, content_hash,
-      // prompt_version), this page was already processed — skip and count as cache hit.
+      // Idempotency: checkpoint covers zero-result pages; take_proposals covers
+      // historical runs from before the checkpoint existed.
       const sourceId = page.source_id ?? scope.sourceId ?? 'default';
+      const processedKey = `${sourceId}|${page.slug}|${ch}`;
+      if (processedPages.has(processedKey)) {
+        result.cache_hits += 1;
+        continue;
+      }
       const cached = await engine.executeRaw<{ id: number }>(
         `SELECT id FROM take_proposals
          WHERE source_id = $1 AND page_slug = $2 AND content_hash = $3 AND prompt_version = $4
@@ -353,13 +381,23 @@ class ProposeTakesPhase extends BaseCyclePhase {
       );
       if (cached.length > 0) {
         result.cache_hits += 1;
+        processedPages.add(processedKey);
+        checkpointNeedsRefresh = true;
         continue;
       }
       result.cache_misses += 1;
 
+      if (result.llm_calls >= maxLlmCalls) {
+        result.request_limit_reached = true;
+        result.warnings.push(
+          `request ceiling reached after ${result.llm_calls} LLM calls; remaining uncached pages deferred`,
+        );
+        break;
+      }
+
       // Budget pre-check before the LLM call. Estimate: ~1500 input tokens + 500 output.
       const budget = this.checkBudget({
-        modelId: opts.model ?? 'claude-sonnet-4-6',
+        modelId: resolvedModel ?? 'claude-sonnet-4-6',
         estimatedInputTokens: 1500,
         maxOutputTokens: 500,
       });
@@ -374,11 +412,12 @@ class ProposeTakesPhase extends BaseCyclePhase {
       // Call the extractor. Errors on a single page log a warning but do not abort.
       let proposals: ProposedTake[];
       try {
+        result.llm_calls += 1;
         proposals = await extractor({
           pagePath: page.slug,
           pageBody: body,
           existingTakes,
-          modelHint: opts.model,
+          modelHint: resolvedModel,
         });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -408,19 +447,35 @@ class ProposeTakesPhase extends BaseCyclePhase {
             p.weight,
             p.domain ?? null,
             JSON.stringify(existingTakes),
-            opts.model ?? 'claude-sonnet-4-6',
+            resolvedModel ?? 'claude-sonnet-4-6',
           ],
         );
         result.proposals_inserted += 1;
       }
+
+      // Mark only after the extractor and proposal writes completed. Extractor
+      // failures remain retryable; a correct zero-result becomes a cache hit.
+      processedPages.add(processedKey);
+      const checkpointWritten = await recordCompleted(engine, checkpoint, [...processedPages]);
+      if (!checkpointWritten) {
+        result.warnings.push(`checkpoint write failed after ${page.slug}; stopping before another LLM call`);
+        break;
+      }
+      checkpointNeedsRefresh = false;
+    }
+
+    // Refresh legacy proposal hits so purge cannot age out an active cache.
+    if (checkpointNeedsRefresh && processedPages.size > 0) {
+      await recordCompleted(engine, checkpoint, [...processedPages]);
     }
 
     if (opts.reporter) opts.reporter.finish();
 
     // v0.42 Wave B3: receipt + rollup for propose_takes. Source-scoped
-    // via the read scope. Receipt only when proposals actually written.
+    // via the read scope. A zero-row receipt still proves the model ran and
+    // the durable page cache advanced.
     const sourceIdForReceipt = scope.sourceId ?? 'default';
-    if (result.proposals_inserted > 0) {
+    if (result.llm_calls > 0) {
       try {
         await writeReceipt(engine, {
           kind: 'takes.proposed',
@@ -430,6 +485,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
           extracted_at: new Date().toISOString(),
           total_rows: result.proposals_inserted,
           cost_usd: 0, // tracker isn't exposed at this layer; cost tracked centrally
+          model_id: resolvedModel,
           summary:
             `Proposed ${result.proposals_inserted} new takes from ${result.pages_scanned} pages ` +
             `(${result.cache_hits} cached).`,
@@ -448,7 +504,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
     return {
       summary: `propose_takes: scanned ${result.pages_scanned} pages, ${result.cache_hits} cached, ${result.proposals_inserted} new proposals (run ${proposalRunId})`,
       details: { ...result, proposal_run_id: proposalRunId, prompt_version: promptVersion },
-      status: result.budget_exhausted ? 'warn' : 'ok',
+      status: result.budget_exhausted || result.request_limit_reached ? 'warn' : 'ok',
     };
   }
 }

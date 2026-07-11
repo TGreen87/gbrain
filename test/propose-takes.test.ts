@@ -42,6 +42,7 @@ function buildMockEngine(opts: {
 }): { engine: BrainEngine; captured: CapturedSql[] } {
   const captured: CapturedSql[] = [];
   const existing = opts.existingProposals ?? new Set<string>();
+  const completedByFingerprint = new Map<string, Set<string>>();
 
   const engine = {
     kind: 'pglite',
@@ -50,6 +51,12 @@ function buildMockEngine(opts: {
     },
     async executeRaw<T>(sql: string, params?: unknown[]): Promise<T[]> {
       captured.push({ sql, params: params ?? [] });
+      // op-checkpoint read used by zero-result proposal caching
+      if (sql.includes('FROM op_checkpoint_paths') && sql.includes('op_checkpoints')) {
+        const fingerprint = String(params?.[1] ?? '');
+        return [...(completedByFingerprint.get(fingerprint) ?? new Set<string>())]
+          .map(ckey => ({ ckey, corrupt: 0 }) as unknown as T);
+      }
       // SELECT idempotency check
       if (sql.includes('SELECT id FROM take_proposals')) {
         const [sourceId, slug, ch, pv] = params ?? [];
@@ -58,6 +65,25 @@ function buildMockEngine(opts: {
         return [];
       }
       // INSERT — return nothing
+      return [];
+    },
+    async executeRawDirect<T>(sql: string, params?: unknown[]): Promise<T[]> {
+      captured.push({ sql, params: params ?? [] });
+      if (sql.includes('INSERT INTO op_checkpoints')) {
+        const fingerprint = String(params?.[1] ?? '');
+        const rawCompleted = params?.[2];
+        let values: unknown[] = [];
+        if (Array.isArray(rawCompleted)) values = rawCompleted;
+        if (typeof rawCompleted === 'string') {
+          try {
+            const parsed = JSON.parse(rawCompleted);
+            if (Array.isArray(parsed)) values = parsed;
+          } catch {
+            values = [];
+          }
+        }
+        completedByFingerprint.set(fingerprint, new Set(values.map(String)));
+      }
       return [];
     },
   } as unknown as BrainEngine;
@@ -383,5 +409,46 @@ New prose appended here.`;
     expect(runIdA).toBe(runIdB);
     expect(typeof runIdA).toBe('string');
     expect((runIdA as string).startsWith('propose-')).toBe(true);
+  });
+
+  test('zero-result pages are checkpointed and do not spend another LLM call', async () => {
+    const pages = [buildPage({ slug: 'wiki/no-gradeable-takes', body: 'A pure factual page.' })];
+    const { engine } = buildMockEngine({ pages });
+    let extractorCalls = 0;
+    const extractor: ProposeTakesExtractor = async () => {
+      extractorCalls++;
+      return [];
+    };
+
+    const first = await runPhaseProposeTakes(buildCtx(engine), { extractor });
+    const second = await runPhaseProposeTakes(buildCtx(engine), { extractor });
+
+    expect(extractorCalls).toBe(1);
+    expect((first.details as Record<string, unknown>).llm_calls).toBe(1);
+    expect((second.details as Record<string, unknown>).cache_hits).toBe(1);
+    expect((second.details as Record<string, unknown>).llm_calls).toBe(0);
+  });
+
+  test('hard request ceiling stops an unattended page fanout', async () => {
+    const pages = Array.from({ length: 6 }, (_, i) =>
+      buildPage({ slug: `wiki/page-${i}`, body: `uncached prose ${i}` }),
+    );
+    const { engine } = buildMockEngine({ pages });
+    let extractorCalls = 0;
+    const extractor: ProposeTakesExtractor = async () => {
+      extractorCalls++;
+      return [];
+    };
+
+    const result = await runPhaseProposeTakes(buildCtx(engine), {
+      extractor,
+      maxLlmCalls: 2,
+    });
+    const details = result.details as Record<string, unknown>;
+
+    expect(extractorCalls).toBe(2);
+    expect(details.llm_calls).toBe(2);
+    expect(details.request_limit_reached).toBe(true);
+    expect(result.status).toBe('warn');
   });
 });
